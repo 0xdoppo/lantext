@@ -150,6 +150,115 @@ Remove-NetFirewallRule -DisplayName "lantext"
 
 ---
 
+## Private SSH tunnel access
+
+If you do not want a public HTTP URL, keep `lantext` bound locally and
+forward it through SSH. The browser still opens HTTP, but only on the
+client machine's loopback address.
+
+### Step 1 - create a client key
+
+Run this on the client machine, for example a Mac:
+
+```bash
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+ssh-keygen -t ed25519 \
+  -f ~/.ssh/id_ed25519_lantext_client_mac \
+  -C "lantext-client-mac" \
+  -N ""
+cat ~/.ssh/id_ed25519_lantext_client_mac.pub
+```
+
+Copy only the `.pub` line to the host. Do not copy the private key.
+
+### Step 2 - authorize the client key on the host
+
+On the machine running `lantext`, add the client public key to
+`~/.ssh/authorized_keys`. To allow only the `lantext` port forward and no
+normal shell, prefix the key like this:
+
+```text
+restrict,port-forwarding,permitopen="127.0.0.1:12345" ssh-ed25519 <client-public-key> lantext-client-mac
+```
+
+Make sure permissions are strict:
+
+```bash
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/authorized_keys
+```
+
+### Step 3 - enable SSH on a WSL host
+
+If the host is Debian in WSL, install and start SSH:
+
+```bash
+sudo apt update
+sudo apt install -y openssh-server
+sudo service ssh start
+```
+
+Then forward a Windows LAN port to WSL SSH. Run PowerShell as
+Administrator and replace the WSL IP with `hostname -I` from WSL:
+
+```powershell
+netsh interface portproxy add v4tov4 `
+  listenport=2222 listenaddress=0.0.0.0 `
+  connectport=22 connectaddress=172.30.201.49
+
+New-NetFirewallRule -DisplayName "WSL SSH 2222" `
+  -Direction Inbound -Protocol TCP -LocalPort 2222 `
+  -Action Allow -Profile Any
+```
+
+### Step 4 - open the tunnel from the client
+
+Use the Windows LAN IP, not the WSL IP. Example:
+
+```bash
+chmod 600 ~/.ssh/id_ed25519_lantext_client_mac
+
+ssh -i ~/.ssh/id_ed25519_lantext_client_mac \
+  -p 2222 \
+  -N \
+  -L 12345:127.0.0.1:12345 \
+  fudgy@192.168.0.43
+```
+
+The SSH command normally prints nothing and keeps running. Leave that
+terminal open, then browse on the client machine to:
+
+```text
+http://127.0.0.1:12345
+```
+
+Do not open `192.168.0.43:2222` in a browser. Port `2222` is SSH, so a
+browser will only show an SSH banner such as `SSH-2.0-OpenSSH...`.
+
+### Accessing from abroad
+
+Addresses like `192.168.0.43` only work on the same LAN. For access from
+outside the network, use one of these:
+
+- Router port forwarding: forward an external TCP port to the Windows LAN
+  IP on port `2222`, then SSH to your home public IP.
+- A private mesh VPN such as Tailscale.
+- A reverse SSH tunnel through a VPS.
+
+With router forwarding in place, the client tunnel looks like:
+
+```bash
+ssh -i ~/.ssh/id_ed25519_lantext_client_mac \
+  -p 2222 \
+  -N \
+  -L 12345:127.0.0.1:12345 \
+  fudgy@<home-public-ip>
+```
+
+Then open `http://127.0.0.1:12345` on the client.
+
+---
+
 ## Files
 
 | File | Purpose |
