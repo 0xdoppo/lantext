@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 from pathlib import Path
 import shlex
@@ -25,6 +26,7 @@ PROJECTS = {
 
 COMMAND_PREFIXES = {"home-codex", "codex-remote", "codex"}
 DEFAULT_CODEX_HOME = Path("/mnt/c/Users/yetim/.codex")
+DEFAULT_CODEX_SQLITE_HOME = Path("/home/fudgy/.codex/sqlite")
 
 
 def parse_original_command() -> list[str]:
@@ -69,6 +71,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", help="optional Codex model override")
     parser.add_argument("--profile", help="optional Codex config profile")
     parser.add_argument(
+        "--app",
+        action="store_true",
+        help="use Codex app-server so the run appears in Codex app thread history",
+    )
+    parser.add_argument(
+        "--thread",
+        help="existing Codex app thread id to resume when using --app",
+    )
+    parser.add_argument(
         "--sandbox",
         default=os.environ.get("HOME_CODEX_SANDBOX", "workspace-write"),
         choices=("read-only", "workspace-write", "danger-full-access"),
@@ -86,6 +97,248 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the resolved Codex command without running it",
     )
     return parser
+
+
+def codex_env(codex: str) -> dict[str, str]:
+    env = os.environ.copy()
+    if "CODEX_HOME" not in env and DEFAULT_CODEX_HOME.is_dir():
+        env["CODEX_HOME"] = str(DEFAULT_CODEX_HOME)
+    if "CODEX_SQLITE_HOME" not in env and DEFAULT_CODEX_SQLITE_HOME.is_dir():
+        env["CODEX_SQLITE_HOME"] = str(DEFAULT_CODEX_SQLITE_HOME)
+    env.setdefault("TERM", "xterm-256color")
+    env.setdefault("RUST_LOG", "error")
+
+    codex_dir = str(Path(codex).parent)
+    env["PATH"] = f"{codex_dir}:{env.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
+    return env
+
+
+def sandbox_policy(mode: str) -> dict[str, object]:
+    if mode == "danger-full-access":
+        return {"type": "dangerFullAccess"}
+    if mode == "read-only":
+        return {"type": "readOnly", "networkAccess": False}
+    return {
+        "type": "workspaceWrite",
+        "writableRoots": [],
+        "networkAccess": False,
+        "excludeTmpdirEnvVar": False,
+        "excludeSlashTmp": False,
+    }
+
+
+class AppServerClient:
+    def __init__(
+        self,
+        codex: str,
+        project_dir: Path,
+        env: dict[str, str],
+        profile: str | None = None,
+    ) -> None:
+        cmd = [codex]
+        if profile:
+            cmd.extend(["--profile", profile])
+        cmd.extend(["app-server", "--stdio"])
+        self.proc = subprocess.Popen(
+            cmd,
+            cwd=str(project_dir),
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=sys.stderr,
+            text=True,
+            bufsize=1,
+        )
+        self.next_id = 1
+        self.final_messages: list[str] = []
+
+    def close(self) -> None:
+        if self.proc.stdin:
+            try:
+                self.proc.stdin.close()
+            except BrokenPipeError:
+                pass
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+
+    def send_request(self, method: str, params: dict[str, object]) -> int:
+        request_id = self.next_id
+        self.next_id += 1
+        self._send({"id": request_id, "method": method, "params": params})
+        return request_id
+
+    def send_notification(self, method: str, params: dict[str, object] | None = None) -> None:
+        message: dict[str, object] = {"method": method}
+        if params is not None:
+            message["params"] = params
+        self._send(message)
+
+    def _send(self, message: dict[str, object]) -> None:
+        if not self.proc.stdin:
+            raise RuntimeError("app-server stdin is closed")
+        self.proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        self.proc.stdin.flush()
+
+    def wait_for_response(self, request_id: int) -> dict[str, object]:
+        while True:
+            message = self.read_message()
+            if "id" in message and "method" in message:
+                self.reply_method_not_supported(message)
+                continue
+            if message.get("id") == request_id:
+                if "error" in message:
+                    error = message["error"]
+                    raise RuntimeError(f"app-server {request_id} error: {error}")
+                result = message.get("result")
+                return result if isinstance(result, dict) else {}
+            self.handle_notification(message)
+
+    def read_until_turn_completed(self) -> int:
+        while True:
+            message = self.read_message()
+            if "id" in message and "method" in message:
+                self.reply_method_not_supported(message)
+                continue
+            if "id" in message:
+                if "error" in message:
+                    print(f"[home-codex] app-server response error: {message['error']}", file=sys.stderr)
+                continue
+            if self.handle_notification(message):
+                return 0
+
+    def read_message(self) -> dict[str, object]:
+        if not self.proc.stdout:
+            raise RuntimeError("app-server stdout is closed")
+        line = self.proc.stdout.readline()
+        if not line:
+            raise RuntimeError("app-server exited before completing the request")
+        return json.loads(line)
+
+    def reply_method_not_supported(self, message: dict[str, object]) -> None:
+        if "id" not in message:
+            return
+        self._send(
+            {
+                "id": message["id"],
+                "error": {
+                    "code": -32601,
+                    "message": "home-codex app mode cannot answer app-server client requests",
+                },
+            }
+        )
+
+    def handle_notification(self, message: dict[str, object]) -> bool:
+        method = message.get("method")
+        params = message.get("params")
+        if not isinstance(params, dict):
+            return False
+
+        if method == "item/completed":
+            item = params.get("item")
+            if isinstance(item, dict) and item.get("type") == "agentMessage":
+                text = item.get("text")
+                if item.get("phase") == "final_answer" and isinstance(text, str):
+                    self.final_messages.append(text)
+        elif method == "turn/completed":
+            turn = params.get("turn")
+            if isinstance(turn, dict) and turn.get("status") != "completed":
+                print(f"[home-codex] turn ended with status: {turn.get('status')}", file=sys.stderr)
+                if turn.get("error"):
+                    print(f"[home-codex] turn error: {turn['error']}", file=sys.stderr)
+                return True
+            return True
+        elif method == "thread/status/changed":
+            status = params.get("status")
+            if isinstance(status, dict) and status.get("type") == "active":
+                print("[home-codex] app turn started", file=sys.stderr)
+        return False
+
+
+def run_app_server(
+    codex: str,
+    project_dir: Path,
+    args: argparse.Namespace,
+    message: str,
+    env: dict[str, str],
+) -> int:
+    client = AppServerClient(codex, project_dir, env, args.profile)
+    try:
+        init_id = client.send_request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "lantext-home-codex-ssh",
+                    "title": "lantext home-codex SSH",
+                    "version": "0.1.0",
+                },
+                "capabilities": {
+                    "experimentalApi": True,
+                    "optOutNotificationMethods": [
+                        "command/exec/outputDelta",
+                        "item/agentMessage/delta",
+                        "item/plan/delta",
+                        "item/fileChange/outputDelta",
+                        "item/reasoning/summaryTextDelta",
+                        "item/reasoning/textDelta",
+                    ],
+                },
+            },
+        )
+        client.wait_for_response(init_id)
+        client.send_notification("initialized")
+
+        thread_params: dict[str, object] = {
+            "cwd": str(project_dir),
+            "runtimeWorkspaceRoots": [str(project_dir)],
+            "approvalPolicy": args.approval,
+            "sandbox": args.sandbox,
+        }
+        if args.model:
+            thread_params["model"] = args.model
+
+        if args.thread:
+            thread_params["threadId"] = args.thread
+            thread_id = args.thread
+            response_id = client.send_request("thread/resume", thread_params)
+        else:
+            response_id = client.send_request("thread/start", thread_params)
+
+        thread_response = client.wait_for_response(response_id)
+        if not args.thread:
+            thread = thread_response.get("thread")
+            if isinstance(thread, dict) and isinstance(thread.get("id"), str):
+                thread_id = thread["id"]
+            else:
+                raise RuntimeError("app-server did not return a thread id")
+
+        print(f"[home-codex] app-thread={thread_id}", file=sys.stderr)
+
+        turn_params: dict[str, object] = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": message, "text_elements": []}],
+            "cwd": str(project_dir),
+            "runtimeWorkspaceRoots": [str(project_dir)],
+            "approvalPolicy": args.approval,
+            "sandboxPolicy": sandbox_policy(args.sandbox),
+        }
+        if args.model:
+            turn_params["model"] = args.model
+
+        turn_id = client.send_request("turn/start", turn_params)
+        client.wait_for_response(turn_id)
+        status = client.read_until_turn_completed()
+        if client.final_messages:
+            print("\n\n".join(client.final_messages))
+        return status
+    finally:
+        client.close()
 
 
 def main() -> int:
@@ -129,13 +382,19 @@ def main() -> int:
 
     print(f"[home-codex] project={args.project} dir={project_dir}", file=sys.stderr)
     if args.dry_run:
-        print(" ".join(shlex.quote(part) for part in cmd))
+        if args.app:
+            app_cmd = [codex, "app-server", "--stdio"]
+            if args.profile:
+                app_cmd = [codex, "--profile", args.profile, "app-server", "--stdio"]
+            target = f" resume thread {args.thread}" if args.thread else " start new app thread"
+            print(" ".join(shlex.quote(part) for part in app_cmd) + target)
+        else:
+            print(" ".join(shlex.quote(part) for part in cmd))
         return 0
 
-    env = os.environ.copy()
-    if "CODEX_HOME" not in env and DEFAULT_CODEX_HOME.is_dir():
-        env["CODEX_HOME"] = str(DEFAULT_CODEX_HOME)
-    env.setdefault("TERM", "xterm-256color")
+    env = codex_env(codex)
+    if args.app:
+        return run_app_server(codex, project_dir, args, message, env)
 
     completed = subprocess.run(cmd, input=message, text=True, check=False, env=env)
     return completed.returncode

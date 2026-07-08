@@ -266,11 +266,24 @@ as the transport. This is separate from the browser tunnel above because
 it grants a stronger permission: the client can ask Codex to edit approved
 projects on the host.
 
-This helper runs `codex exec` on the host. It is useful for terminal-style
-automation, but it creates a separate non-interactive Codex session. Its
-messages stream back to the SSH terminal and do not appear in the current
-Codex Desktop thread history. For app-visible conversation history, approvals,
-and streamed events, use Codex remote control or app-server instead.
+By default, this helper runs `codex exec` on the host. That is useful for
+terminal-style automation, but it creates a separate non-interactive Codex
+session. Its messages stream back to the SSH terminal and do not appear in the
+current Codex Desktop thread history.
+
+For app-visible history, use `--app`. That mode runs `codex app-server` on the
+host, so the run is stored in the Codex app thread database:
+
+```bash
+ssh home_pc 'home-codex --app -p lantext -m "say what repo you are in"'
+```
+
+To continue an existing visible Codex thread, pass its thread id. Only do this
+when that thread is idle:
+
+```bash
+ssh home_pc 'home-codex --app --thread <thread-id> -p lantext -m "say what repo you are in"'
+```
 
 Do not shadow the real `codex` CLI on the client. Codex already uses `-p`
 for profile and `-m` for model, so this repo uses a small wrapper named
@@ -295,7 +308,7 @@ The dispatcher currently allows this project alias:
 |---|---|
 | `lantext` | `/home/fudgy/random/lantext` |
 
-It runs:
+By default, it runs:
 
 ```bash
 codex -s workspace-write -a never exec -C /home/fudgy/random/lantext --color never -
@@ -306,6 +319,12 @@ the installed dispatcher also points Codex at the desktop app state by using
 `CODEX_HOME=/mnt/c/Users/yetim/.codex` when SSH does not provide `CODEX_HOME`.
 That lets the SSH command reuse the saved local Codex login without copying
 tokens into SSH config or `authorized_keys`.
+
+With `--app`, it runs `codex app-server --stdio`, starts or resumes a Codex app
+thread, sends a `turn/start` request, waits for `turn/completed`, and prints the
+final assistant message back to SSH. App-server also needs Unix-side SQLite
+state, so the dispatcher sets
+`CODEX_SQLITE_HOME=/home/fudgy/.codex/sqlite` when SSH does not provide it.
 
 To add more projects, edit the `PROJECTS` map in
 `scripts/lantext-codex-ssh` and reinstall the dispatcher.
