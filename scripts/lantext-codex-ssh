@@ -24,6 +24,7 @@ PROJECTS = {
 }
 
 COMMAND_PREFIXES = {"home-codex", "codex-remote", "codex"}
+DEFAULT_CODEX_HOME = Path("/mnt/c/Users/yetim/.codex")
 
 
 def parse_original_command() -> list[str]:
@@ -131,7 +132,12 @@ def main() -> int:
         print(" ".join(shlex.quote(part) for part in cmd))
         return 0
 
-    completed = subprocess.run(cmd, input=message, text=True, check=False)
+    env = os.environ.copy()
+    if "CODEX_HOME" not in env and DEFAULT_CODEX_HOME.is_dir():
+        env["CODEX_HOME"] = str(DEFAULT_CODEX_HOME)
+    env.setdefault("TERM", "xterm-256color")
+
+    completed = subprocess.run(cmd, input=message, text=True, check=False, env=env)
     return completed.returncode
 
 

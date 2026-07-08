@@ -266,6 +266,12 @@ as the transport. This is separate from the browser tunnel above because
 it grants a stronger permission: the client can ask Codex to edit approved
 projects on the host.
 
+This helper runs `codex exec` on the host. It is useful for terminal-style
+automation, but it creates a separate non-interactive Codex session. Its
+messages stream back to the SSH terminal and do not appear in the current
+Codex Desktop thread history. For app-visible conversation history, approvals,
+and streamed events, use Codex remote control or app-server instead.
+
 Do not shadow the real `codex` CLI on the client. Codex already uses `-p`
 for profile and `-m` for model, so this repo uses a small wrapper named
 `home-codex` instead:
@@ -292,10 +298,17 @@ The dispatcher currently allows this project alias:
 It runs:
 
 ```bash
-codex -s workspace-write -a never exec -C /home/fudgy/random/lantext
+codex -s workspace-write -a never exec -C /home/fudgy/random/lantext --color never -
 ```
 
-The prompt is sent over stdin to avoid shell quoting problems.
+The prompt is sent over stdin to avoid shell quoting problems. On this host,
+the installed dispatcher also points Codex at the desktop app state by using
+`CODEX_HOME=/mnt/c/Users/yetim/.codex` when SSH does not provide `CODEX_HOME`.
+That lets the SSH command reuse the saved local Codex login without copying
+tokens into SSH config or `authorized_keys`.
+
+To add more projects, edit the `PROJECTS` map in
+`scripts/lantext-codex-ssh` and reinstall the dispatcher.
 
 ### Step 2 - create a separate Codex SSH key
 
