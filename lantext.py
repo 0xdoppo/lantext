@@ -13,14 +13,102 @@ import queue
 import socket
 import threading
 import datetime
+import mimetypes
+import urllib.parse
+import uuid
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 PORT     = 12345
 MAX_MSGS = 500
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 messages    = []
+files       = {}
 subscribers = []
 lock        = threading.Lock()
+
+# ── message/file helpers ─────────────────────────────────────────────────────
+
+def prune_messages():
+    while len(messages) > MAX_MSGS:
+        old = messages.pop(0)
+        for att in old.get("attachments", []):
+            file_id = att.get("id")
+            if file_id:
+                files.pop(file_id, None)
+
+
+def make_message(sender, text="", attachments=None):
+    now = datetime.datetime.now()
+    return {
+        "time":        now.strftime("%H:%M:%S"),
+        "date":        now.strftime("%Y-%m-%d"),
+        "sender":      sender[:32],
+        "text":        text,
+        "attachments": attachments or [],
+    }
+
+
+def add_message(msg):
+    with lock:
+        messages.append(msg)
+        prune_messages()
+    broadcast(msg)
+
+
+def safe_filename(name):
+    name = (name or "file").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    return name[:160] or "file"
+
+
+def parse_multipart(headers, body):
+    content_type = headers.get("Content-Type", "")
+    raw = (
+        f"Content-Type: {content_type}\r\n"
+        "MIME-Version: 1.0\r\n\r\n"
+    ).encode("utf-8") + body
+    form = BytesParser(policy=email_policy).parsebytes(raw)
+    if not form.is_multipart():
+        raise ValueError("expected multipart/form-data")
+
+    text = ""
+    upload_parts = []
+    for part in form.iter_parts():
+        if part.get_content_disposition() != "form-data":
+            continue
+
+        name = part.get_param("name", header="content-disposition")
+        filename = part.get_filename()
+        payload = part.get_payload(decode=True) or b""
+
+        if name == "text" and not filename:
+            charset = part.get_content_charset() or "utf-8"
+            text = payload.decode(charset, errors="replace").strip()
+        elif name == "file" and filename and payload:
+            clean_name = safe_filename(filename)
+            mime = part.get_content_type() or mimetypes.guess_type(clean_name)[0]
+            if not mime or mime == "application/octet-stream":
+                mime = mimetypes.guess_type(clean_name)[0] or "application/octet-stream"
+            upload_parts.append({
+                "name": clean_name,
+                "mime": mime,
+                "data": payload,
+                "size": len(payload),
+            })
+
+    return text, upload_parts
+
+
+def json_response(handler, status, payload):
+    body = json.dumps(payload).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler._cors()
+    handler.end_headers()
+    handler.wfile.write(body)
 
 # ── broadcast to all SSE listeners ──────────────────────────────────────────
 
@@ -175,6 +263,24 @@ HTML = r"""<!DOCTYPE html>
 
   #msg-count { color: var(--dim); font-size: 11px; white-space: nowrap; }
 
+  #nav-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .nav-btn {
+    width: 28px;
+    height: 28px;
+    border: 1px solid var(--border2);
+    border-radius: 3px;
+    background: var(--bg);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .nav-btn:hover { color: var(--bright); border-color: var(--accent); }
+
   /* hide count on very small screens */
   @media (max-width: 380px) { #msg-count { display: none; } }
 
@@ -209,8 +315,8 @@ HTML = r"""<!DOCTYPE html>
       background: rgba(255,255,255,.025);
       border-left-color: var(--accent);
     }
-    .msg:hover .copy-btn { opacity: 1; }
-    .copy-btn { opacity: 0; }
+    .msg:hover .copy-btn, .msg:hover .collapse-btn { opacity: 1; }
+    .copy-btn, .collapse-btn { opacity: 0; }
   }
 
   /* mobile/touch: copy button always visible, smaller */
@@ -222,6 +328,13 @@ HTML = r"""<!DOCTYPE html>
       height: 16px !important;
     }
     .msg:active { background: rgba(255,255,255,.04); }
+    .collapse-btn {
+      opacity: 1 !important;
+      font-size: 11px !important;
+      padding: 0 4px !important;
+      height: 16px !important;
+      min-width: 24px !important;
+    }
   }
 
   .ts {
@@ -249,6 +362,14 @@ HTML = r"""<!DOCTYPE html>
   }
   @media (max-width: 400px) { .sender { max-width: 72px; } }
 
+  .content {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
   .body {
     flex: 1;
     color: var(--bright);
@@ -260,7 +381,68 @@ HTML = r"""<!DOCTYPE html>
     min-width: 0;
   }
 
-  .copy-btn {
+  .body:empty { display: none; }
+
+  .collapsed-summary {
+    display: none;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .msg.collapsed .body,
+  .msg.collapsed .attachments { display: none; }
+  .msg.collapsed .collapsed-summary { display: block; }
+
+  .attachments {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-width: min(100%, 560px);
+  }
+  .attachment {
+    border: 1px solid var(--border2);
+    border-radius: 4px;
+    background: rgba(255,255,255,.02);
+    overflow: hidden;
+  }
+  .image-attachment a { display: block; }
+  .image-attachment img {
+    display: block;
+    width: 100%;
+    max-height: 360px;
+    object-fit: contain;
+    background: #050607;
+  }
+  .attachment-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 6px 8px;
+    color: var(--muted);
+    font-size: 11px;
+    border-top: 1px solid var(--border);
+  }
+  .attachment-meta span:first-child,
+  .file-attachment a span:first-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .file-attachment a {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px;
+    color: var(--bright);
+    text-decoration: none;
+  }
+  .file-attachment a:hover { color: var(--cyan); }
+  .file-size { color: var(--muted); white-space: nowrap; }
+
+  .copy-btn, .collapse-btn {
     background: none;
     border: 1px solid var(--border2);
     border-radius: 2px;
@@ -280,8 +462,10 @@ HTML = r"""<!DOCTYPE html>
     -webkit-tap-highlight-color: transparent;
   }
   .copy-btn:hover  { color: var(--bright); border-color: var(--accent); }
-  .copy-btn:active { color: var(--bright); border-color: var(--accent); }
+  .copy-btn:active, .collapse-btn:active { color: var(--bright); border-color: var(--accent); }
   .copy-btn.flash  { color: var(--green);  border-color: var(--green); }
+  .collapse-btn { min-width: 24px; }
+  .collapse-btn:hover { color: var(--bright); border-color: var(--accent); }
 
   .day-divider {
     display: flex;
@@ -313,6 +497,7 @@ HTML = r"""<!DOCTYPE html>
     padding-bottom: calc(10px + var(--safe-bottom));
     border-top: 1px solid var(--border);
     background: var(--surface);
+    flex-wrap: wrap;
     flex-shrink: 0;
   }
 
@@ -324,6 +509,51 @@ HTML = r"""<!DOCTYPE html>
     line-height: 1;
   }
   @media (max-width: 480px) { #prompt { display: none; } }
+
+  #file-tray {
+    flex-basis: 100%;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  #file-tray[hidden] { display: none; }
+  .file-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    border: 1px solid var(--border2);
+    border-radius: 3px;
+    background: var(--bg);
+    color: var(--text);
+    padding: 4px 6px;
+    font-size: 11px;
+  }
+  .file-chip span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .file-chip button {
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    font-family: var(--mono);
+  }
+  #attach-btn {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+    border: 1px solid var(--border2);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 18px;
+    cursor: pointer;
+  }
+  #attach-btn:hover { border-color: var(--accent); color: var(--cyan); }
 
   #msg-input {
     flex: 1;
@@ -366,6 +596,7 @@ HTML = r"""<!DOCTYPE html>
     -webkit-tap-highlight-color: transparent;
   }
   #send-btn:hover  { background: var(--cyan); }
+  #send-btn:disabled, #attach-btn:disabled { opacity: .45; cursor: wait; }
   #send-btn:active { transform: scale(.96); background: var(--cyan); }
 
   /* sender colours */
@@ -395,12 +626,19 @@ HTML = r"""<!DOCTYPE html>
              autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
     </div>
     <span id="msg-count">0 msgs</span>
+    <div id="nav-actions">
+      <button class="nav-btn" id="top-btn" title="Go to top" aria-label="Go to top">↑</button>
+      <button class="nav-btn" id="bottom-btn" title="Go to bottom" aria-label="Go to bottom">↓</button>
+    </div>
   </div>
 
   <div id="feed"></div>
 
   <div id="input-bar">
+    <div id="file-tray" hidden></div>
     <div id="prompt">&gt;</div>
+    <input id="file-input" type="file" multiple hidden>
+    <button id="attach-btn" title="Attach files" aria-label="Attach files">+</button>
     <textarea id="msg-input" rows="1"
               placeholder="message…"
               autocorrect="off" autocapitalize="sentences" spellcheck="true"></textarea>
@@ -413,10 +651,15 @@ HTML = r"""<!DOCTYPE html>
   const feed      = document.getElementById('feed');
   const input     = document.getElementById('msg-input');
   const sendBtn   = document.getElementById('send-btn');
+  const attachBtn = document.getElementById('attach-btn');
+  const fileInput = document.getElementById('file-input');
+  const fileTray  = document.getElementById('file-tray');
   const nameInput = document.getElementById('name-input');
   const dot       = document.getElementById('dot');
   const statusTxt = document.getElementById('status-txt');
   const msgCount  = document.getElementById('msg-count');
+  const topBtn    = document.getElementById('top-btn');
+  const bottomBtn = document.getElementById('bottom-btn');
 
   // ── detect touch device ──
   const isTouch = () => window.matchMedia('(hover: none)').matches;
@@ -467,6 +710,58 @@ HTML = r"""<!DOCTYPE html>
     return palette[sender];
   }
 
+  function formatBytes(bytes) {
+    if (!bytes) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let size = bytes;
+    let idx = 0;
+    while (size >= 1024 && idx < units.length - 1) {
+      size /= 1024;
+      idx++;
+    }
+    return (idx === 0 ? size : size.toFixed(size >= 10 ? 0 : 1)) + ' ' + units[idx];
+  }
+
+  function messageCopyText(msg) {
+    const parts = [];
+    if (msg.text) parts.push(msg.text);
+    (msg.attachments || []).forEach(att => {
+      parts.push(`${att.name} ${location.origin}${att.url}`);
+    });
+    return parts.join('\n');
+  }
+
+  let selectedFiles = [];
+  function renderFileTray() {
+    fileTray.replaceChildren();
+    fileTray.hidden = selectedFiles.length === 0;
+    selectedFiles.forEach((file, idx) => {
+      const chip = document.createElement('div');
+      chip.className = 'file-chip';
+      const label = document.createElement('span');
+      label.textContent = `${file.name} · ${formatBytes(file.size)}`;
+      label.title = file.name;
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.textContent = '×';
+      remove.title = 'Remove file';
+      remove.addEventListener('click', () => {
+        selectedFiles.splice(idx, 1);
+        renderFileTray();
+      });
+      chip.appendChild(label);
+      chip.appendChild(remove);
+      fileTray.appendChild(chip);
+    });
+  }
+
+  attachBtn.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => {
+    selectedFiles = selectedFiles.concat(Array.from(fileInput.files || []));
+    fileInput.value = '';
+    renderFileTray();
+  });
+
   // ── name persistence ──
   nameInput.value = localStorage.getItem('lantext-name') || '';
   nameInput.addEventListener('change', () =>
@@ -481,6 +776,65 @@ HTML = r"""<!DOCTYPE html>
   // ── message rendering ──
   let lastDate   = null;
   let totalCount = 0;
+
+  function renderAttachments(attachments) {
+    if (!attachments || !attachments.length) return null;
+    const wrap = document.createElement('div');
+    wrap.className = 'attachments';
+
+    attachments.forEach(att => {
+      const item = document.createElement('div');
+      item.className = 'attachment ' + (att.isImage ? 'image-attachment' : 'file-attachment');
+
+      if (att.isImage) {
+        const link = document.createElement('a');
+        link.href = att.url;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        const img = document.createElement('img');
+        img.src = att.url;
+        img.alt = att.name;
+        img.loading = 'lazy';
+        link.appendChild(img);
+        item.appendChild(link);
+      } else {
+        const link = document.createElement('a');
+        link.href = att.url;
+        link.download = att.name;
+        const name = document.createElement('span');
+        name.textContent = att.name;
+        const size = document.createElement('span');
+        size.className = 'file-size';
+        size.textContent = formatBytes(att.size);
+        link.appendChild(name);
+        link.appendChild(size);
+        item.appendChild(link);
+      }
+
+      const meta = document.createElement('div');
+      meta.className = 'attachment-meta';
+      const label = document.createElement('span');
+      label.textContent = att.name;
+      label.title = att.name;
+      const size = document.createElement('span');
+      size.textContent = formatBytes(att.size);
+      meta.appendChild(label);
+      meta.appendChild(size);
+      if (att.isImage) item.appendChild(meta);
+
+      wrap.appendChild(item);
+    });
+    return wrap;
+  }
+
+  function summaryFor(msg) {
+    const parts = [];
+    const text = (msg.text || '').replace(/\s+/g, ' ').trim();
+    if (text) parts.push(text.length > 90 ? text.slice(0, 90) + '…' : text);
+    const count = (msg.attachments || []).length;
+    if (count) parts.push(count + ' file' + (count === 1 ? '' : 's'));
+    return parts.join(' · ') || '(empty)';
+  }
 
   function renderMsg(msg, isNew = false) {
     if (msg.date && msg.date !== lastDate) {
@@ -498,7 +852,7 @@ HTML = r"""<!DOCTYPE html>
     if (isTouch()) {
       let pressTimer;
       row.addEventListener('touchstart', () => {
-        pressTimer = setTimeout(() => copyText(msg.text || '', btn), 600);
+        pressTimer = setTimeout(() => copyText(messageCopyText(msg), btn), 600);
       }, { passive: true });
       row.addEventListener('touchend',   () => clearTimeout(pressTimer), { passive: true });
       row.addEventListener('touchmove',  () => clearTimeout(pressTimer), { passive: true });
@@ -515,9 +869,26 @@ HTML = r"""<!DOCTYPE html>
     sender.className = 'sender ' + colorFor(msg.sender || '?');
     sender.textContent = (msg.sender || '?').substring(0, 16);
 
+    const content = document.createElement('div');
+    content.className = 'content';
+
     const body = document.createElement('span');
     body.className = 'body';
     body.textContent = msg.text || '';
+
+    const summary = document.createElement('span');
+    summary.className = 'collapsed-summary';
+    summary.textContent = summaryFor(msg);
+
+    content.appendChild(body);
+    const attachments = renderAttachments(msg.attachments);
+    if (attachments) content.appendChild(attachments);
+    content.appendChild(summary);
+
+    const collapseBtn = document.createElement('button');
+    collapseBtn.className = 'collapse-btn';
+    collapseBtn.textContent = '−';
+    collapseBtn.title = 'Collapse message';
 
     const btn = document.createElement('button');
     btn.className = 'copy-btn';
@@ -525,12 +896,22 @@ HTML = r"""<!DOCTYPE html>
     btn.title = 'Copy message';
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
-      copyText(msg.text || '', btn);
+      copyText(messageCopyText(msg), btn);
     });
+
+    collapseBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const collapsed = row.classList.toggle('collapsed');
+      collapseBtn.textContent = collapsed ? '+' : '−';
+      collapseBtn.title = collapsed ? 'Expand message' : 'Collapse message';
+      collapseBtn.setAttribute('aria-label', collapseBtn.title);
+    });
+    collapseBtn.setAttribute('aria-label', 'Collapse message');
 
     row.appendChild(ts);
     row.appendChild(sender);
-    row.appendChild(body);
+    row.appendChild(content);
+    row.appendChild(collapseBtn);
     row.appendChild(btn);
     feed.appendChild(row);
 
@@ -543,6 +924,9 @@ HTML = r"""<!DOCTYPE html>
     const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < thresh;
     if (atBottom || force) feed.scrollTop = feed.scrollHeight;
   }
+
+  topBtn.addEventListener('click', () => feed.scrollTo({ top: 0, behavior: 'smooth' }));
+  bottomBtn.addEventListener('click', () => scrollBottom(true));
 
   // ── SSE connection ──
   let es;
@@ -586,24 +970,47 @@ HTML = r"""<!DOCTYPE html>
 
   async function sendMsg() {
     const text = input.value.trim();
-    if (!text) return;
-    input.value = '';
-    input.style.height = 'auto';
+    const filesToSend = selectedFiles.slice();
+    if (!text && filesToSend.length === 0) return;
 
-    // keep keyboard open on mobile after send
-    if (!isTouch()) input.focus();
+    sendBtn.disabled = true;
+    attachBtn.disabled = true;
 
     try {
-      await fetch('/send', {
-        method: 'POST',
-        headers: { 'X-Sender': getSender() },
-        body: text
-      });
+      if (filesToSend.length) {
+        const form = new FormData();
+        form.append('text', text);
+        filesToSend.forEach(file => form.append('file', file, file.name));
+        const resp = await fetch('/upload', {
+          method: 'POST',
+          headers: { 'X-Sender': getSender() },
+          body: form
+        });
+        if (!resp.ok) throw new Error(await resp.text());
+      } else {
+        const resp = await fetch('/send', {
+          method: 'POST',
+          headers: { 'X-Sender': getSender() },
+          body: text
+        });
+        if (!resp.ok) throw new Error(await resp.text());
+      }
+
+      input.value = '';
+      input.style.height = 'auto';
+      selectedFiles = [];
+      renderFileTray();
+
+      // keep keyboard open on mobile after send
+      if (!isTouch()) input.focus();
     } catch(e) {
       const row = document.createElement('div');
       row.className = 'sys-msg';
       row.textContent = '⚠ send failed';
       feed.appendChild(row);
+    } finally {
+      sendBtn.disabled = false;
+      attachBtn.disabled = false;
     }
   }
 
@@ -639,7 +1046,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        if self.path == "/":
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/":
             body = HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -648,7 +1056,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
-        elif self.path == "/events":
+        elif path == "/events":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -691,7 +1099,28 @@ class Handler(BaseHTTPRequestHandler):
                 if q in subscribers:
                     subscribers.remove(q)
 
-        elif self.path == "/messages":
+        elif path.startswith("/file/"):
+            file_id = urllib.parse.unquote(path.rsplit("/", 1)[-1])
+            with lock:
+                item = files.get(file_id)
+            if not item:
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            name = item["name"].replace('"', "'")
+            data = item["data"]
+            self.send_response(200)
+            self.send_header("Content-Type", item["mime"])
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", f'inline; filename="{name}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self._cors()
+            self.end_headers()
+            self.wfile.write(data)
+
+        elif path == "/messages":
             with lock:
                 body = json.dumps(messages).encode()
             self.send_response(200)
@@ -706,24 +1135,15 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        if self.path == "/send":
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/send":
             length = int(self.headers.get("Content-Length", 0))
             body   = self.rfile.read(length).decode("utf-8", errors="replace").strip()
 
             if body:
                 sender = self.headers.get("X-Sender", "") or self.client_address[0]
-                now    = datetime.datetime.now()
-                msg    = {
-                    "time":   now.strftime("%H:%M:%S"),
-                    "date":   now.strftime("%Y-%m-%d"),
-                    "sender": sender[:32],
-                    "text":   body,
-                }
-                with lock:
-                    messages.append(msg)
-                    if len(messages) > MAX_MSGS:
-                        messages.pop(0)
-                broadcast(msg)
+                msg    = make_message(sender, body)
+                add_message(msg)
                 resp = b"ok"
             else:
                 resp = b"empty"
@@ -733,6 +1153,45 @@ class Handler(BaseHTTPRequestHandler):
             self._cors()
             self.end_headers()
             self.wfile.write(resp)
+        elif path == "/upload":
+            length = int(self.headers.get("Content-Length", 0))
+            if length > MAX_UPLOAD_BYTES:
+                json_response(self, 413, {"ok": False, "error": "upload too large"})
+                return
+
+            body = self.rfile.read(length)
+            try:
+                text, upload_parts = parse_multipart(self.headers, body)
+            except Exception as exc:
+                json_response(self, 400, {"ok": False, "error": str(exc)})
+                return
+
+            if not text and not upload_parts:
+                json_response(self, 400, {"ok": False, "error": "empty upload"})
+                return
+
+            sender = self.headers.get("X-Sender", "") or self.client_address[0]
+            attachments = []
+            stored = {}
+            for item in upload_parts:
+                file_id = uuid.uuid4().hex
+                stored[file_id] = item
+                attachments.append({
+                    "id":      file_id,
+                    "name":    item["name"],
+                    "mime":    item["mime"],
+                    "size":    item["size"],
+                    "url":     f"/file/{file_id}",
+                    "isImage": item["mime"].startswith("image/"),
+                })
+
+            msg = make_message(sender, text, attachments)
+            with lock:
+                files.update(stored)
+                messages.append(msg)
+                prune_messages()
+            broadcast(msg)
+            json_response(self, 200, {"ok": True, "message": msg})
         else:
             self.send_response(404)
             self.end_headers()

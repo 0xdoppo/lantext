@@ -14,6 +14,13 @@ python3 lantext.py
 Open the dashboard at `http://localhost:12345` (this machine) or the IP
 printed in the terminal (other devices).
 
+The dashboard supports:
+
+- text messages
+- file attachments up to 25 MB per request
+- inline image previews
+- collapsible messages plus top/bottom navigation buttons
+
 ---
 
 ## Sending messages
