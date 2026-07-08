@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  home-codex -pc home_pc -p lantext -m "do some codex query"
+
+Options:
+  -pc, --pc HOST_ALIAS    SSH host alias, for example home_pc
+  -h,  --help             Show this help
+
+All other arguments are forwarded to the home-PC forced command.
+EOF
+}
+
+pc=""
+remote_args=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -pc|--pc)
+      if [[ $# -lt 2 ]]; then
+        echo "home-codex: $1 requires a host alias" >&2
+        exit 2
+      fi
+      pc="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      remote_args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$pc" ]]; then
+  echo "home-codex: missing -pc/--pc host alias" >&2
+  usage >&2
+  exit 2
+fi
+
+if [[ ${#remote_args[@]} -eq 0 ]]; then
+  echo "home-codex: missing remote command arguments" >&2
+  usage >&2
+  exit 2
+fi
+
+remote_cmd="home-codex"
+for arg in "${remote_args[@]}"; do
+  remote_cmd+=" $(printf '%q' "$arg")"
+done
+
+exec ssh "$pc" "$remote_cmd"

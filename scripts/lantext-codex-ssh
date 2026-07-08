@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""
+SSH forced-command dispatcher for running Codex against approved projects.
+
+Install this outside the repo, then point an authorized_keys command="..."
+entry at the installed copy. It accepts a small argument surface and pipes the
+message into `codex exec` without going through a shell.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+
+
+PROJECTS = {
+    "lantext": Path("/home/fudgy/random/lantext"),
+}
+
+COMMAND_PREFIXES = {"home-codex", "codex-remote", "codex"}
+
+
+def parse_original_command() -> list[str]:
+    original = os.environ.get("SSH_ORIGINAL_COMMAND")
+    if original:
+        try:
+            args = shlex.split(original)
+        except ValueError as exc:
+            raise SystemExit(f"could not parse SSH command: {exc}") from exc
+    else:
+        args = sys.argv[1:]
+
+    if args and args[0] in COMMAND_PREFIXES:
+        args = args[1:]
+    return args
+
+
+def find_codex() -> str:
+    env_bin = os.environ.get("CODEX_BIN")
+    if env_bin and os.access(env_bin, os.X_OK):
+        return env_bin
+
+    path_bin = shutil.which("codex")
+    if path_bin:
+        return path_bin
+
+    candidates = glob.glob("/mnt/c/Users/yetim/.codex/bin/wsl/*/codex")
+    candidates = [path for path in candidates if os.access(path, os.X_OK)]
+    if candidates:
+        return max(candidates, key=os.path.getmtime)
+
+    raise SystemExit("could not find codex; set CODEX_BIN to the full codex path")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="home-codex",
+        description="Run Codex on an approved home-PC project over SSH.",
+    )
+    parser.add_argument("-p", "--project", required=True, choices=sorted(PROJECTS))
+    parser.add_argument("-m", "--message", help="prompt to send to Codex")
+    parser.add_argument("--model", help="optional Codex model override")
+    parser.add_argument("--profile", help="optional Codex config profile")
+    parser.add_argument(
+        "--sandbox",
+        default=os.environ.get("HOME_CODEX_SANDBOX", "workspace-write"),
+        choices=("read-only", "workspace-write", "danger-full-access"),
+        help="Codex sandbox mode; defaults to workspace-write",
+    )
+    parser.add_argument(
+        "--approval",
+        default=os.environ.get("HOME_CODEX_APPROVAL", "never"),
+        choices=("untrusted", "on-request", "never"),
+        help="Codex approval mode; defaults to never for non-interactive SSH use",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the resolved Codex command without running it",
+    )
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args(parse_original_command())
+
+    message = args.message
+    if not message and not sys.stdin.isatty():
+        message = sys.stdin.read().strip()
+    if not message:
+        parser.error("provide a message with -m/--message or stdin")
+
+    project_dir = PROJECTS[args.project]
+    if not project_dir.is_dir():
+        raise SystemExit(f"project path does not exist: {project_dir}")
+
+    codex = find_codex()
+    cmd = [
+        codex,
+        "exec",
+        "-C",
+        str(project_dir),
+        "-s",
+        args.sandbox,
+        "-a",
+        args.approval,
+        "--color",
+        "never",
+    ]
+    if args.model:
+        cmd.extend(["--model", args.model])
+    if args.profile:
+        cmd.extend(["--profile", args.profile])
+    cmd.append("-")
+
+    print(f"[home-codex] project={args.project} dir={project_dir}", file=sys.stderr)
+    if args.dry_run:
+        print(" ".join(shlex.quote(part) for part in cmd))
+        return 0
+
+    completed = subprocess.run(cmd, input=message, text=True, check=False)
+    return completed.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

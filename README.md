@@ -178,7 +178,7 @@ On the machine running `lantext`, add the client public key to
 normal shell, prefix the key like this:
 
 ```text
-restrict,port-forwarding,permitopen="127.0.0.1:12345" ssh-ed25519 <client-public-key> lantext-client-mac
+command="/bin/false",restrict,port-forwarding,permitopen="127.0.0.1:12345" ssh-ed25519 <client-public-key> lantext-client-mac
 ```
 
 Make sure permissions are strict:
@@ -259,12 +259,117 @@ Then open `http://127.0.0.1:12345` on the client.
 
 ---
 
+## Remote Codex command over SSH
+
+You can also run Codex on the home PC from another machine by using SSH
+as the transport. This is separate from the browser tunnel above because
+it grants a stronger permission: the client can ask Codex to edit approved
+projects on the host.
+
+Do not shadow the real `codex` CLI on the client. Codex already uses `-p`
+for profile and `-m` for model, so this repo uses a small wrapper named
+`home-codex` instead:
+
+```bash
+home-codex -pc home_pc -p lantext -m "do some codex query"
+```
+
+### Step 1 - install the host dispatcher
+
+On the home PC, install the forced-command dispatcher outside the repo:
+
+```bash
+mkdir -p ~/.local/bin
+install -m 755 scripts/lantext-codex-ssh ~/.local/bin/lantext-codex-ssh
+```
+
+The dispatcher currently allows this project alias:
+
+| Alias | Directory |
+|---|---|
+| `lantext` | `/home/fudgy/random/lantext` |
+
+It runs:
+
+```bash
+codex exec -C /home/fudgy/random/lantext -s workspace-write -a never
+```
+
+The prompt is sent over stdin to avoid shell quoting problems.
+
+### Step 2 - create a separate Codex SSH key
+
+Use a different key from the `lantext` browser tunnel key. On the client:
+
+```bash
+ssh-keygen -t ed25519 \
+  -f ~/.ssh/id_ed25519_home_codex_client \
+  -C "home-codex-client-mac" \
+  -N ""
+cat ~/.ssh/id_ed25519_home_codex_client.pub
+```
+
+Copy only the `.pub` line to the host.
+
+### Step 3 - authorize the Codex key on the host
+
+Add the public key to `~/.ssh/authorized_keys` with a forced command:
+
+```text
+command="/home/fudgy/.local/bin/lantext-codex-ssh",restrict ssh-ed25519 <client-public-key> home-codex-client-mac
+```
+
+This key does not get a normal shell; every SSH command is routed through
+`lantext-codex-ssh`.
+
+### Step 4 - add a client SSH alias
+
+On the client, add a host alias to `~/.ssh/config`:
+
+```sshconfig
+Host home_pc
+  HostName 192.168.0.43
+  User fudgy
+  Port 2222
+  IdentityFile ~/.ssh/id_ed25519_home_codex_client
+  IdentitiesOnly yes
+```
+
+Use the current Windows LAN IP for `HostName`.
+
+### Step 5 - install the client wrapper
+
+If this repo is available on the client:
+
+```bash
+mkdir -p ~/.local/bin
+install -m 755 scripts/home-codex ~/.local/bin/home-codex
+```
+
+Otherwise, the raw SSH command is:
+
+```bash
+ssh home_pc home-codex -p lantext -m "do some codex query"
+```
+
+The wrapper just turns this:
+
+```bash
+home-codex -pc home_pc -p lantext -m "do some codex query"
+```
+
+into the raw SSH command above.
+
+---
+
 ## Files
 
 | File | Purpose |
 |---|---|
 | `lantext.py` | Server — run this on one machine |
 | `send.py` | CLI sender — use from any machine |
+| `scripts/home-codex` | Client wrapper for remote Codex over SSH |
+| `scripts/lantext-codex-ssh` | Host forced-command dispatcher for remote Codex |
 | `README.md` | This file |
 
 ## Technical notes
