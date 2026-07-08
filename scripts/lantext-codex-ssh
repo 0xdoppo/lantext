@@ -110,13 +110,13 @@ def main() -> int:
     codex = find_codex()
     cmd = [
         codex,
-        "exec",
-        "-C",
-        str(project_dir),
         "-s",
         args.sandbox,
         "-a",
         args.approval,
+        "exec",
+        "-C",
+        str(project_dir),
         "--color",
         "never",
     ]

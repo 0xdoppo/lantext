@@ -292,7 +292,7 @@ The dispatcher currently allows this project alias:
 It runs:
 
 ```bash
-codex exec -C /home/fudgy/random/lantext -s workspace-write -a never
+codex -s workspace-write -a never exec -C /home/fudgy/random/lantext
 ```
 
 The prompt is sent over stdin to avoid shell quoting problems.
