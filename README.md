@@ -349,7 +349,7 @@ install -m 755 scripts/home-codex ~/.local/bin/home-codex
 Otherwise, the raw SSH command is:
 
 ```bash
-ssh home_pc home-codex -p lantext -m "do some codex query"
+ssh home_pc 'home-codex -p lantext -m "do some codex query"'
 ```
 
 The wrapper just turns this:
@@ -359,6 +359,11 @@ home-codex -pc home_pc -p lantext -m "do some codex query"
 ```
 
 into the raw SSH command above.
+
+If you pass the raw SSH command without quoting the remote command, SSH
+removes the local quotes before the host sees them. The dispatcher accepts
+that common form for simple messages, but quoting the remote command is
+more reliable.
 
 ---
 

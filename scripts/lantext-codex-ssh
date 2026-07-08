@@ -89,9 +89,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     parser = build_parser()
-    args = parser.parse_args(parse_original_command())
+    args, extra = parser.parse_known_args(parse_original_command())
+    if extra and not args.message:
+        parser.error(f"unrecognized arguments: {' '.join(extra)}")
+    if extra and any(part.startswith("-") for part in extra):
+        parser.error(f"unrecognized option in message arguments: {' '.join(extra)}")
 
     message = args.message
+    if extra:
+        message = " ".join([message, *extra])
     if not message and not sys.stdin.isatty():
         message = sys.stdin.read().strip()
     if not message:
