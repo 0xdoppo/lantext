@@ -298,6 +298,26 @@ HTML = r"""<!DOCTYPE html>
   #feed::-webkit-scrollbar-track { background: transparent; }
   #feed::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
 
+  #drop-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    align-items: center;
+    justify-content: center;
+    background: rgba(10, 12, 14, .78);
+    border: 2px dashed var(--accent);
+    color: var(--bright);
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    pointer-events: none;
+  }
+  body.dragging-files #drop-overlay {
+    display: flex;
+  }
+
   .msg {
     display: flex;
     align-items: flex-start;
@@ -307,6 +327,10 @@ HTML = r"""<!DOCTYPE html>
     cursor: default;
     /* larger tap target on mobile */
     min-height: 32px;
+  }
+  .msg.menu-open {
+    background: rgba(255,255,255,.035);
+    border-left-color: var(--accent);
   }
 
   /* desktop: show copy on hover */
@@ -488,6 +512,54 @@ HTML = r"""<!DOCTYPE html>
     font-style: italic;
   }
 
+  #ctx-menu {
+    display: none;
+    position: fixed;
+    z-index: 1001;
+    min-width: 180px;
+    padding: 4px;
+    border: 1px solid var(--border2);
+    border-radius: 4px;
+    background: #080a0c;
+    box-shadow: 0 10px 30px rgba(0,0,0,.4);
+  }
+  #ctx-menu.open {
+    display: block;
+  }
+  #ctx-menu button {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    min-height: 30px;
+    padding: 6px 8px;
+    border: 0;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+  }
+  #ctx-menu button:hover,
+  #ctx-menu button:focus {
+    background: rgba(56,189,248,.12);
+    color: var(--bright);
+    outline: none;
+  }
+  #ctx-menu button[disabled] {
+    color: var(--dim);
+    cursor: default;
+  }
+  #ctx-menu button[disabled]:hover {
+    background: transparent;
+  }
+  .ctx-sep {
+    height: 1px;
+    margin: 4px 2px;
+    background: var(--border);
+  }
+
   /* ── input bar ── */
   #input-bar {
     display: flex;
@@ -633,6 +705,8 @@ HTML = r"""<!DOCTYPE html>
   </div>
 
   <div id="feed"></div>
+  <div id="drop-overlay">Drop files to attach</div>
+  <div id="ctx-menu" role="menu" aria-hidden="true"></div>
 
   <div id="input-bar">
     <div id="file-tray" hidden></div>
@@ -654,6 +728,8 @@ HTML = r"""<!DOCTYPE html>
   const attachBtn = document.getElementById('attach-btn');
   const fileInput = document.getElementById('file-input');
   const fileTray  = document.getElementById('file-tray');
+  const dropOverlay = document.getElementById('drop-overlay');
+  const ctxMenu   = document.getElementById('ctx-menu');
   const nameInput = document.getElementById('name-input');
   const dot       = document.getElementById('dot');
   const statusTxt = document.getElementById('status-txt');
@@ -665,12 +741,13 @@ HTML = r"""<!DOCTYPE html>
   const isTouch = () => window.matchMedia('(hover: none)').matches;
 
   // ── clipboard: modern API with fallback for mobile ──
-  function copyText(text, btn) {
+  function copyText(text, btn, restoreText) {
+    const originalText = restoreText || btn.textContent || 'copy';
     const finish = (ok) => {
       btn.textContent = ok ? 'copied!' : 'failed';
       btn.classList.toggle('flash', ok);
       setTimeout(() => {
-        btn.textContent = 'copy';
+        btn.textContent = originalText;
         btn.classList.remove('flash');
       }, 1200);
     };
@@ -755,11 +832,17 @@ HTML = r"""<!DOCTYPE html>
     });
   }
 
+  function addFiles(files) {
+    const incoming = Array.from(files || []).filter(file => file && file.size > 0);
+    if (!incoming.length) return;
+    selectedFiles = selectedFiles.concat(incoming);
+    renderFileTray();
+  }
+
   attachBtn.addEventListener('click', () => fileInput.click());
   fileInput.addEventListener('change', () => {
-    selectedFiles = selectedFiles.concat(Array.from(fileInput.files || []));
+    addFiles(fileInput.files);
     fileInput.value = '';
-    renderFileTray();
   });
 
   // ── name persistence ──
@@ -836,6 +919,101 @@ HTML = r"""<!DOCTYPE html>
     return parts.join(' · ') || '(empty)';
   }
 
+  function saveAttachment(att) {
+    const link = document.createElement('a');
+    link.href = att.url;
+    link.download = att.name || 'lantext-file';
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  function saveAttachments(attachments) {
+    attachments.forEach((att, idx) => {
+      setTimeout(() => saveAttachment(att), idx * 80);
+    });
+  }
+
+  function setCollapsed(row, collapseBtn, collapsed) {
+    row.classList.toggle('collapsed', collapsed);
+    collapseBtn.textContent = collapsed ? '+' : '−';
+    collapseBtn.title = collapsed ? 'Expand message' : 'Collapse message';
+    collapseBtn.setAttribute('aria-label', collapseBtn.title);
+  }
+
+  function toggleCollapsed(row, collapseBtn) {
+    setCollapsed(row, collapseBtn, !row.classList.contains('collapsed'));
+  }
+
+  let activeMenuRow = null;
+
+  function closeContextMenu() {
+    ctxMenu.classList.remove('open');
+    ctxMenu.setAttribute('aria-hidden', 'true');
+    ctxMenu.replaceChildren();
+    if (activeMenuRow) activeMenuRow.classList.remove('menu-open');
+    activeMenuRow = null;
+  }
+
+  function menuButton(label, handler, disabled = false) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = label;
+    button.disabled = disabled;
+    if (!disabled) {
+      button.addEventListener('click', (e) => {
+        e.stopPropagation();
+        handler(button);
+      });
+    }
+    return button;
+  }
+
+  function menuSeparator() {
+    const sep = document.createElement('div');
+    sep.className = 'ctx-sep';
+    return sep;
+  }
+
+  function showContextMenu(e, msg, row, collapseBtn) {
+    e.preventDefault();
+    closeContextMenu();
+
+    const attachments = msg.attachments || [];
+    const collapsed = row.classList.contains('collapsed');
+    const saveLabel = attachments.length === 0
+      ? 'Save attachment'
+      : attachments.length === 1
+        ? 'Save ' + (attachments[0].isImage ? 'image' : 'file')
+        : 'Save all files';
+
+    ctxMenu.appendChild(menuButton(saveLabel, () => {
+      saveAttachments(attachments);
+      closeContextMenu();
+    }, attachments.length === 0));
+    ctxMenu.appendChild(menuButton('Copy message', (button) => {
+      copyText(messageCopyText(msg), button, 'Copy message');
+    }));
+    ctxMenu.appendChild(menuSeparator());
+    ctxMenu.appendChild(menuButton(collapsed ? 'Expand message' : 'Collapse message', () => {
+      toggleCollapsed(row, collapseBtn);
+      closeContextMenu();
+    }));
+
+    row.classList.add('menu-open');
+    activeMenuRow = row;
+    ctxMenu.classList.add('open');
+    ctxMenu.setAttribute('aria-hidden', 'false');
+    ctxMenu.style.left = '0px';
+    ctxMenu.style.top = '0px';
+    const rect = ctxMenu.getBoundingClientRect();
+    const left = Math.max(8, Math.min(e.clientX, window.innerWidth - rect.width - 8));
+    const top = Math.max(8, Math.min(e.clientY, window.innerHeight - rect.height - 8));
+    ctxMenu.style.left = left + 'px';
+    ctxMenu.style.top = top + 'px';
+  }
+
   function renderMsg(msg, isNew = false) {
     if (msg.date && msg.date !== lastDate) {
       lastDate = msg.date;
@@ -901,10 +1079,7 @@ HTML = r"""<!DOCTYPE html>
 
     collapseBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      const collapsed = row.classList.toggle('collapsed');
-      collapseBtn.textContent = collapsed ? '+' : '−';
-      collapseBtn.title = collapsed ? 'Expand message' : 'Collapse message';
-      collapseBtn.setAttribute('aria-label', collapseBtn.title);
+      toggleCollapsed(row, collapseBtn);
     });
     collapseBtn.setAttribute('aria-label', 'Collapse message');
 
@@ -914,6 +1089,8 @@ HTML = r"""<!DOCTYPE html>
     row.appendChild(collapseBtn);
     row.appendChild(btn);
     feed.appendChild(row);
+
+    row.addEventListener('contextmenu', (e) => showContextMenu(e, msg, row, collapseBtn));
 
     totalCount++;
     msgCount.textContent = totalCount + ' msg' + (totalCount === 1 ? '' : 's');
@@ -927,6 +1104,49 @@ HTML = r"""<!DOCTYPE html>
 
   topBtn.addEventListener('click', () => feed.scrollTo({ top: 0, behavior: 'smooth' }));
   bottomBtn.addEventListener('click', () => scrollBottom(true));
+
+  // ── drag/drop files ──
+  let dragDepth = 0;
+  function hasDraggedFiles(dt) {
+    return dt && Array.from(dt.types || []).includes('Files');
+  }
+
+  window.addEventListener('dragenter', (e) => {
+    if (!hasDraggedFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    dragDepth++;
+    document.body.classList.add('dragging-files');
+  });
+
+  window.addEventListener('dragover', (e) => {
+    if (!hasDraggedFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  });
+
+  window.addEventListener('dragleave', (e) => {
+    if (!hasDraggedFiles(e.dataTransfer)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) document.body.classList.remove('dragging-files');
+  });
+
+  window.addEventListener('drop', (e) => {
+    if (!hasDraggedFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    dragDepth = 0;
+    document.body.classList.remove('dragging-files');
+    addFiles(e.dataTransfer.files);
+  });
+
+  // ── context menu lifecycle ──
+  window.addEventListener('click', (e) => {
+    if (!ctxMenu.contains(e.target)) closeContextMenu();
+  });
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeContextMenu();
+  });
+  window.addEventListener('resize', closeContextMenu);
+  feed.addEventListener('scroll', closeContextMenu, { passive: true });
 
   // ── SSE connection ──
   let es;

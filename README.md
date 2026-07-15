@@ -19,7 +19,9 @@ The dashboard supports:
 - text messages
 - file attachments up to 25 MB per request
 - inline image previews
+- drag-and-drop files into the window to stage attachments
 - collapsible messages plus top/bottom navigation buttons
+- right-click message actions for saving attachments, copying, and collapse/expand
 
 ---
 
